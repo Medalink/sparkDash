@@ -917,7 +917,7 @@ export function LlmPanel({
               {(() => {
                 const engine = engineStateLabel(llm);
                 return (
-                  <b className={engine.muted ? "text-muted" : undefined} title={engine.title}>
+                  <b className={engine.alert ? "text-danger" : engine.muted ? "text-muted" : undefined} title={engine.title}>
                     {engine.text}
                   </b>
                 );
@@ -945,6 +945,8 @@ export function LlmPanel({
                       className="absolute left-0 top-full z-10 mt-1 w-56 rounded-xl border border-border-strong bg-surface-elevated px-3 py-2 text-left text-[11px] font-normal normal-case text-text shadow-lg"
                     >
                       Active = processing or ready for requests. Sleeping = idle, GPU memory freed until next request.
+                      TensorFold also shows Stalled (the engine's current step has run for 5+ minutes) or
+                      Error (/health reports ok: false).
                     </div>
                   )}
                 </button>

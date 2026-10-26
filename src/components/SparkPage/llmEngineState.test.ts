@@ -20,6 +20,19 @@ describe("engineStateLabel", () => {
     expect(engineStateLabel(llm(1))).toEqual({ text: "Active", muted: false });
   });
 
+  it("prefers the explicit TensorFold engine state and flags problems", () => {
+    expect(engineStateLabel({ ...llm(1), engineState: "busy" })).toEqual({
+      text: "Active · busy",
+      muted: false,
+      alert: false,
+    });
+    expect(engineStateLabel({ ...llm(1), engineState: "stalled" })).toEqual({
+      text: "Stalled",
+      muted: false,
+      alert: true,
+    });
+  });
+
   it("keeps the dash when there is no LLM at all", () => {
     expect(engineStateLabel(null).text).toBe("—");
   });
