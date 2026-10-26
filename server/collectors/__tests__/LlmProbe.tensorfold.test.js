@@ -566,13 +566,14 @@ test("_applyTensorFoldMetrics: prompt_tokens_cached_total feeds the token ledger
   await kept._applyTensorFoldMetrics(2);
   assert.equal(kept.totalCachedTokens, 321);
 
-  // A queue-only poll reads no totals, so it must not clear the cached counter.
-  const queueOnly = metricsProbe(() =>
+  // The cached counters are read on every poll: a totals-mode parse still
+  // applies them (spill v2 builds publish the split only here, issue #281).
+  const totalsMode = metricsProbe(() =>
     lines(["tensorfold:prompt_tokens_cached_total 640"])
   );
-  queueOnly.totalCachedTokens = 42;
-  await queueOnly._applyTensorFoldMetrics(undefined, true);
-  assert.equal(queueOnly.totalCachedTokens, 42);
+  totalsMode.totalCachedTokens = 42;
+  await totalsMode._applyTensorFoldMetrics(undefined, true);
+  assert.equal(totalsMode.totalCachedTokens, 640);
 });
 
 test("_applyTensorFoldMetrics reads the TensorFold 1.1 KV occupancy ratio", async () => {
@@ -699,17 +700,17 @@ test("_applyTensorFoldMetrics: no histogram → aggregate ÷ running, null when 
   assert.equal(probe.perStreamTps, null); // idle with no measured rate → null again
 });
 
-test("_applyTensorFoldMetrics: queueOnly poll does not disturb the per-stream baseline", async () => {
+test("_applyTensorFoldMetrics: a totals-mode poll does not disturb the per-stream baseline", async () => {
   let txt = tfMetrics({ gen: 1000, tpotCount: 100, tpotSum: 5 });
   const probe = metricsProbe(() => txt);
   await probe._applyTensorFoldMetrics(2);
   txt = tfMetrics({ gen: 1200, tpotCount: 150, tpotSum: 7.5, reqWaiting: 3 });
   await probe._applyTensorFoldMetrics(undefined, true);
   assert.equal(probe.requestsWaiting, 3);
-  assert.equal(probe.perStreamTps, null); // queueOnly never consumes the histogram window
+  assert.equal(probe.perStreamTps, null); // a totals-mode poll never consumes the histogram window
   txt = tfMetrics({ gen: 1400, tpotCount: 200, tpotSum: 10 });
   await probe._applyTensorFoldMetrics(2);
-  assert.equal(probe.perStreamTps, 20); // 100 tokens / 5 s — measured from the FIRST sample, proving the queueOnly poll consumed nothing
+  assert.equal(probe.perStreamTps, 20); // 100 tokens / 5 s — measured from the FIRST sample, proving the totals-mode poll consumed nothing
 });
 
 test("snapshot: perStreamTps exposed, null by default", async () => {

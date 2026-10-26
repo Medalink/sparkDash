@@ -517,6 +517,8 @@ export class LlmProbe {
     this.lastPrefillKinds = null;
     this.lastTtftSum = null;
     this.lastTtftCount = null;
+    this._tensorfoldMtpFromHealth = false;
+    this._tensorfoldWaitingFromHealth = false;
     this.lastIterSum = null;
     this.lastRadianceSteps = null;
     this._sglangStickyTps = null;
@@ -979,31 +981,59 @@ export class LlmProbe {
     // TensorFold: no Prometheus. /health carries cumulative token totals when the
     // server publishes them; without them tok/s stays 0 rather than guessing.
     if (this.backendType === "tensorfold") {
+      // Both endpoints are read on every poll, in parallel: either can carry data the
+      // other lacks. A /health with lifetime totals whose waiting gauge and latency
+      // histograms only exist in /metrics (issue #239); cached-token counters that
+      // only exist in /metrics (issue #281); and /metrics token totals that cover
+      // finished requests only, which must not stomp the lifetime /health ones.
+      const [healthRes, metricsRes] = await Promise.allSettled([
+        this._fetch(`${this.baseUrl}/health`),
+        this._fetch(`${this.baseUrl}/metrics`),
+      ]);
       // The body is read even on a failed status: a 503 carrying {ok: false} is the
       // engine reporting itself broken, which the Engine tile shows as Error.
       let health = null;
       let healthStatus = null;
-      try {
-        const healthRes = await this._fetch(`${this.baseUrl}/health`);
-        healthStatus = healthRes.status;
-        health = await healthRes.json().catch(() => null);
-      } catch {}
-      this._applyTensorFoldHealth(healthStatus != null && healthStatus >= 200 && healthStatus < 400 ? health : null, dtSec);
-      if (health != null && healthStatus != null && healthStatus >= 200 && healthStatus < 400) {
+      if (healthRes.status === "fulfilled") {
+        healthStatus = healthRes.value.status;
+        health = await healthRes.value.json().catch(() => null);
+      }
+      const healthOk = healthStatus != null && healthStatus >= 200 && healthStatus < 400;
+      let metricsTxt = null;
+      if (metricsRes.status === "fulfilled") {
+        this._noteAuthStatus(metricsRes.value.status);
+        if (metricsRes.value.ok) metricsTxt = await metricsRes.value.text();
+      }
+      this._applyTensorFoldHealth(healthOk ? health : null, dtSec);
+      if (healthOk && health) {
         this._applyTensorFoldLive(health);
-        // Newer builds report live rates in /health but cumulative totals only on Prometheus /metrics.
+        // When /health carries the lifetime totals it stays the authority for them
+        // (and for the rates, running count and KV pool it reported); the parse
+        // then only adds what /health cannot report. A live decode rate the server
+        // reports itself wins over the /metrics counter diff.
         const totalRaw = health.completion_tokens_total;
-        if (totalRaw == null || !Number.isFinite(Number(totalRaw))) {
-          // A decode rate the server reports itself wins over the /metrics counter diff.
-          const liveDecode = health.live?.decode_tokens_per_second;
-          const hasLiveDecode = liveDecode != null && Number.isFinite(Number(liveDecode));
-          await this._applyTensorFoldMetrics(hasLiveDecode ? undefined : dtSec);
-        } else if (this.requestsWaiting == null) {
-          // A /health with token totals but no waiting count (TensorFold's Python engine) keeps
-          // its queue gauge in /metrics alone: poll it queue-only, so /health stays the authority
-          // for totals, rates, drafts and slots, and only the waiting gauge refreshes. A
-          // `live.waiting` the server reports itself is not overwritten.
-          await this._applyTensorFoldMetrics(undefined, true);
+        const hasTotals = totalRaw != null && Number.isFinite(Number(totalRaw));
+        // Lifetime accepted / proposed draft tokens of finished requests: a build
+        // that reports them in /health wins over the /metrics counters.
+        const drafted = tfCount(health.drafted_total);
+        const accepted = tfCount(health.accepted_total);
+        this._tensorfoldMtpFromHealth = drafted != null && accepted != null && drafted > 0;
+        if (this._tensorfoldMtpFromHealth) {
+          this.mtpAcceptanceRate = Math.round(Math.min(1, accepted / drafted) * 10000) / 10000;
+        }
+        const liveDecode = health.live?.decode_tokens_per_second;
+        const hasLiveDecode = liveDecode != null && Number.isFinite(Number(liveDecode));
+        const liveWaiting = health.live?.waiting;
+        this._tensorfoldWaitingFromHealth = liveWaiting != null && Number.isFinite(Number(liveWaiting));
+        this._applyTensorFoldMetricsText(metricsTxt, hasTotals || hasLiveDecode ? undefined : dtSec, hasTotals);
+        // A /health that reports cached_tokens_total owns the lifetime cache split:
+        // its counters are sticky, so a gap in /health keeps the last reading.
+        if (hasTotals && health.cached_tokens_total != null) {
+          const prompt = this.totalPromptTokens;
+          this.prefixCacheHitRate =
+            this.totalCachedTokens != null && prompt != null && prompt > 0
+              ? Math.round(Math.min(1, this.totalCachedTokens / prompt) * 10000) / 10000
+              : null;
         }
       }
       // Last: reads the final requestsRunning (lanes from /health, then /metrics).
@@ -2020,36 +2050,48 @@ export class LlmProbe {
   }
 
   /**
-   * TensorFold Prometheus /metrics (`tensorfold:*`): cumulative token totals (finished requests),
-   * running / waiting requests and the MTP draft acceptance rate. Best effort: a miss changes nothing.
-   * Builds whose /health is only `{"status": "ok"}` (tensorfold-native) report counters here alone,
+   * Fetch GET /metrics and apply it; see _applyTensorFoldMetricsText. Builds whose
+   * /health is only {"status": "ok"} (tensorfold-native) report counters here alone,
    * so decode tok/s comes from this poll-window diff.
    * @param {number} [dtSec]
-   * @param {boolean} [queueOnly=false] apply only the waiting gauge: for builds whose /health
-   * carries the totals but no waiting count, /metrics is still the queue's only source.
+   * @param {boolean} [healthHasTotals=false] the /health of this poll carried the
+   *   lifetime totals: skip its /metrics twins, read only what /health cannot report.
    */
-  async _applyTensorFoldMetrics(dtSec, queueOnly = false) {
-    let txt;
+  async _applyTensorFoldMetrics(dtSec, healthHasTotals = false) {
+    let txt = null;
     try {
       const res = await this._fetch(`${this.baseUrl}/metrics`);
-      if (!res.ok) return;
-      txt = await res.text();
-    } catch {
-      return;
-    }
+      if (res.ok) txt = await res.text();
+    } catch {}
+    this._applyTensorFoldMetricsText(txt, dtSec, healthHasTotals);
+  }
+
+  /**
+   * Apply TensorFold Prometheus /metrics (`tensorfold:*`) from a body the caller
+   * already has. Best effort: a miss changes nothing. `healthHasTotals` marks a
+   * build whose /health already reported the lifetime totals, rates, running
+   * count and KV pool: those /metrics series then cover finished requests only
+   * and must not stomp what /health owns (issue #239). The wait queue, latency
+   * histograms, preemptions and the cached-token counters are read either way.
+   * @param {string | null} txt body of GET /metrics, null when absent
+   * @param {number} [dtSec]
+   * @param {boolean} [healthHasTotals=false]
+   */
+  _applyTensorFoldMetricsText(txt, dtSec, healthHasTotals = false) {
     if (typeof txt !== "string" || !txt.includes("tensorfold:")) return;
+    const full = !healthHasTotals;
     const m = (name) => this._getPromMetric(txt, `tensorfold:${name}`);
-    const gen = queueOnly ? null : m("generation_tokens_total");
-    const prompt = queueOnly ? null : m("prompt_tokens_total");
+    const gen = full ? m("generation_tokens_total") : null;
+    const prompt = full ? m("prompt_tokens_total") : null;
     if (Number.isFinite(gen) && gen >= 0) this.totalOutputTokens = gen;
     if (Number.isFinite(prompt) && prompt >= 0) this.totalPromptTokens = prompt;
     // TensorFold publishes the prompt-cache split of finished requests, either under
     // its own name or as vLLM's prefix-cache hits. Keep it from this scrape's prompt
     // total and never let a cached count exceed the prompt it belongs to. Builds that
     // publish neither leave the previous value alone.
-    const cached = queueOnly ? null : m("prompt_tokens_cached_total");
+    const cached = m("prompt_tokens_cached_total") ?? m("prompt_cache_cached_tokens");
     const cachedFallback =
-      queueOnly || (Number.isFinite(cached) && cached >= 0) ? null : m("prefix_cache_hits_total");
+      Number.isFinite(cached) && cached >= 0 ? null : m("prefix_cache_hits_total");
     const cachedTotal =
       Number.isFinite(cached) && cached >= 0
         ? cached
@@ -2077,17 +2119,19 @@ export class LlmProbe {
     // `requests_running` and the vLLM-style alias `num_requests_running` with
     // identical values (verified live); read the canonical name and fall back
     // to the alias only when the canonical series is absent. Never sum them.
-    let running = queueOnly ? null : m("requests_running");
-    if ((!Number.isFinite(running) || running < 0) && !queueOnly) running = m("num_requests_running");
+    let running = full ? m("requests_running") : null;
+    if ((!Number.isFinite(running) || running < 0) && full) running = m("num_requests_running");
     if (Number.isFinite(running) && running >= 0) {
       this.requestsRunning = Math.round(running);
       this.slotsActive = Math.round(running);
     }
     let waiting = m("requests_waiting");
     if (!Number.isFinite(waiting) || waiting < 0) waiting = m("num_requests_waiting");
-    if (Number.isFinite(waiting) && waiting >= 0) this.requestsWaiting = Math.round(waiting);
+    if (Number.isFinite(waiting) && waiting >= 0 && (full || !this._tensorfoldWaitingFromHealth)) {
+      this.requestsWaiting = Math.round(waiting);
+    }
 
-    if (!queueOnly) {
+    {
       // TensorFold exposes Prometheus histograms under the same names as its
       // vLLM-compatible aliases. A malformed/partial histogram yields null,
       // never a guessed percentile.
@@ -2109,7 +2153,8 @@ export class LlmProbe {
         return value == null ? null : Math.round(value * 1000) / 1000;
       };
       this.ttftP95Seconds = p95("time_to_first_token_seconds");
-      this.e2eP95Seconds = p95("request_latency_seconds");
+      this.e2eP95Seconds =
+        p95("request_latency_seconds") ?? p95("e2e_request_latency_seconds");
       this.itlP95Seconds = p95("request_time_per_output_token_seconds");
 
       const mean = (metric) => {
@@ -2120,22 +2165,24 @@ export class LlmProbe {
       };
       this.ttftSeconds = mean("time_to_first_token_seconds");
 
+      const preemptions = m("preemptions_total");
+      this.preemptionsTotal =
+        Number.isFinite(preemptions) && preemptions >= 0 ? Math.round(preemptions) : null;
+    }
+
+    if (full) {
       const queries = m("prefix_cache_queries_total");
       const hits = m("prefix_cache_hits_total");
       this.prefixCacheHitRate =
         Number.isFinite(queries) && queries > 0 && Number.isFinite(hits)
           ? Math.max(0, Math.min(1, hits / queries))
           : null;
-
-      const preemptions = m("preemptions_total");
-      this.preemptionsTotal =
-        Number.isFinite(preemptions) && preemptions >= 0 ? Math.round(preemptions) : null;
     }
 
-    const kv = queueOnly ? null : m("kv_cache_usage_ratio");
+    const kv = full ? m("kv_cache_usage_ratio") : null;
     if (Number.isFinite(kv) && kv >= 0) this.kvCacheUsage = Math.min(1, kv);
-    const drafted = queueOnly ? null : m("mtp_drafted_total");
-    const accepted = queueOnly ? null : m("mtp_accepted_total");
+    const drafted = full || !this._tensorfoldMtpFromHealth ? m("mtp_drafted_total") : null;
+    const accepted = full || !this._tensorfoldMtpFromHealth ? m("mtp_accepted_total") : null;
     if (Number.isFinite(drafted) && drafted > 0 && Number.isFinite(accepted)) {
       this.mtpAcceptanceRate = Math.max(0, Math.min(1, accepted / drafted));
     }
@@ -2144,7 +2191,7 @@ export class LlmProbe {
     // histogram only moves when a request finishes, so with no finished
     // request in this window the previous value is held rather than flashed
     // to 0; with no histogram at all, fall back to aggregate / active streams.
-    if (!queueOnly) {
+    if (full) {
       const tpotCount = m("request_time_per_output_token_seconds_count");
       const tpotSum = m("request_time_per_output_token_seconds_sum");
       if (Number.isFinite(tpotCount) && Number.isFinite(tpotSum) && tpotCount >= 0 && tpotSum >= 0) {
@@ -2181,7 +2228,7 @@ export class LlmProbe {
     // CAVEAT: prompt_tokens_total counts prefix-cache tokens too and this
     // surface has no cached counter — the number is an effective rate, not raw
     // GPU compute speed (the label says so).
-    if (!queueOnly && Number.isFinite(dtSec) && dtSec > 0) {
+    if (full && Number.isFinite(dtSec) && dtSec > 0) {
       let prefillPrefix = null;
       if (m("request_prefill_seconds_count") != null) prefillPrefix = "request_prefill_seconds";
       else if (m("request_prefill_time_seconds_count") != null) prefillPrefix = "request_prefill_time_seconds";
