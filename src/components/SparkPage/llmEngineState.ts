@@ -1,4 +1,4 @@
-import type { LlmMetrics } from "../../api/types";
+import type { LlmEngineState, LlmMetrics } from "../../api/types";
 
 export interface EngineStateLabel {
   text: string;
@@ -6,7 +6,23 @@ export interface EngineStateLabel {
   title?: string;
   /** Render muted — the value is an absence, not a reading. */
   muted: boolean;
+  /** Render as a problem (stalled or failed engine). */
+  alert?: boolean;
 }
+
+/** Engine tile text for backends that report an explicit state (TensorFold). */
+const ENGINE_STATE_LABEL: Record<LlmEngineState, string> = {
+  ready: "Active · idle",
+  busy: "Active · busy",
+  stalled: "Stalled",
+  error: "Error",
+};
+const ENGINE_STATE_ALERT: Record<LlmEngineState, boolean> = {
+  ready: false,
+  busy: false,
+  stalled: true,
+  error: true,
+};
 
 /**
  * The LLM panel's Engine tile. `gpuMemoryUtilization` carries the engine
@@ -17,6 +33,13 @@ export interface EngineStateLabel {
  */
 export function engineStateLabel(llm: LlmMetrics | null | undefined): EngineStateLabel {
   if (!llm) return { text: "—", muted: false };
+  if (llm.engineState) {
+    return {
+      text: ENGINE_STATE_LABEL[llm.engineState],
+      muted: false,
+      alert: ENGINE_STATE_ALERT[llm.engineState],
+    };
+  }
   // A successful Strata probe requires a loaded engine. Idle means the model
   // is ready for work, not asleep; it has no vLLM-style sleep gauge.
   if (llm.backend === "strata") {

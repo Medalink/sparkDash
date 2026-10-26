@@ -49,6 +49,26 @@ const SGLANG_INFO_FIELDS = [
 const SGLANG_STICKY_TPS_LIVE_MS = 6_000;
 
 /**
+ * Seconds a TensorFold scheduler step may run before the Engine tile reads
+ * Stalled: a step that has not returned in five minutes is not coming back
+ * on its own (the engine's own watchdog gives up and dumps every thread's
+ * stack at that point).
+ */
+const TENSORFOLD_STALLED_STEP_S = 300;
+
+/**
+ * Non-negative finite number from a TensorFold payload field; null when the
+ * key is absent (the engine omits what it cannot measure) or malformed.
+ * @param {unknown} v
+ * @returns {number | null}
+ */
+function tfCount(v) {
+  if (v == null || typeof v === "boolean") return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/**
  * Prefer a short model id when the server returns a Hugging Face hub cache path.
  * e.g. /root/.cache/huggingface/hub/models--org--Name/snapshots/<hash>
  *   → org/Name
@@ -113,6 +133,8 @@ export class LlmProbe {
     this.models = [];
     this.contextLength = null;
     this.gpuMemoryUtilization = null;
+    /** TensorFold engine state from /health ("ready" | "busy" | "stalled" | "error"); null elsewhere. */
+    this.engineState = null;
     this.slotsActive = 0;
     this.slotsTotal = 0;
     this.generationTps = 0;
@@ -449,6 +471,7 @@ export class LlmProbe {
     this.uncachedPrefillTps = null;
     this.contextLength = null;
     this.gpuMemoryUtilization = null;
+    this.engineState = null;
     this.slotsActive = 0;
     this.slotsTotal = 0;
     this.totalOutputTokens = 0;
@@ -956,32 +979,35 @@ export class LlmProbe {
     // TensorFold: no Prometheus. /health carries cumulative token totals when the
     // server publishes them; without them tok/s stays 0 rather than guessing.
     if (this.backendType === "tensorfold") {
+      // The body is read even on a failed status: a 503 carrying {ok: false} is the
+      // engine reporting itself broken, which the Engine tile shows as Error.
+      let health = null;
+      let healthStatus = null;
       try {
         const healthRes = await this._fetch(`${this.baseUrl}/health`);
-        if (healthRes.ok) {
-          const health = await healthRes.json().catch(() => null);
-          this._applyTensorFoldHealth(health, dtSec);
-          this._applyTensorFoldLive(health);
-          // Newer builds report live rates in /health but cumulative totals only on Prometheus /metrics.
-          const totalRaw = health?.completion_tokens_total;
-          if (totalRaw == null || !Number.isFinite(Number(totalRaw))) {
-            // A decode rate the server reports itself wins over the /metrics counter diff.
-            const liveDecode = health?.live?.decode_tokens_per_second;
-            const hasLiveDecode = liveDecode != null && Number.isFinite(Number(liveDecode));
-            await this._applyTensorFoldMetrics(hasLiveDecode ? undefined : dtSec);
-          } else if (this.requestsWaiting == null) {
-            // A /health with token totals but no waiting count (TensorFold's Python engine) keeps
-            // its queue gauge in /metrics alone: poll it queue-only, so /health stays the authority
-            // for totals, rates, drafts and slots, and only the waiting gauge refreshes. A
-            // `live.waiting` the server reports itself is not overwritten.
-            await this._applyTensorFoldMetrics(undefined, true);
-          }
-        } else {
-          this._applyTensorFoldHealth(null, dtSec);
+        healthStatus = healthRes.status;
+        health = await healthRes.json().catch(() => null);
+      } catch {}
+      this._applyTensorFoldHealth(healthStatus != null && healthStatus >= 200 && healthStatus < 400 ? health : null, dtSec);
+      if (health != null && healthStatus != null && healthStatus >= 200 && healthStatus < 400) {
+        this._applyTensorFoldLive(health);
+        // Newer builds report live rates in /health but cumulative totals only on Prometheus /metrics.
+        const totalRaw = health.completion_tokens_total;
+        if (totalRaw == null || !Number.isFinite(Number(totalRaw))) {
+          // A decode rate the server reports itself wins over the /metrics counter diff.
+          const liveDecode = health.live?.decode_tokens_per_second;
+          const hasLiveDecode = liveDecode != null && Number.isFinite(Number(liveDecode));
+          await this._applyTensorFoldMetrics(hasLiveDecode ? undefined : dtSec);
+        } else if (this.requestsWaiting == null) {
+          // A /health with token totals but no waiting count (TensorFold's Python engine) keeps
+          // its queue gauge in /metrics alone: poll it queue-only, so /health stays the authority
+          // for totals, rates, drafts and slots, and only the waiting gauge refreshes. A
+          // `live.waiting` the server reports itself is not overwritten.
+          await this._applyTensorFoldMetrics(undefined, true);
         }
-      } catch {
-        this._applyTensorFoldHealth(null, dtSec);
       }
+      // Last: reads the final requestsRunning (lanes from /health, then /metrics).
+      this.engineState = this._tensorFoldEngineState(health, healthStatus);
       return this._getSnapshot();
     }
 
@@ -1942,6 +1968,29 @@ export class LlmProbe {
       this.prefillTps = 0;
     }
     this._tensorfoldPrefillSeconds = prefillSec;
+  }
+
+  /**
+   * TensorFold engine state for the Engine tile: "error" when the engine
+   * answers with a failure status or `ok: false`, "stalled" once its current
+   * step (`iteration_s`) has run for TENSORFOLD_STALLED_STEP_S while requests
+   * are still running, otherwise busy / ready. null when /health did not
+   * answer with a JSON object (the tile reads "-").
+   * @param {unknown} data parsed /health body, null when the engine did not answer
+   * @param {number | null} status HTTP status of the /health response
+   * @returns {"ready" | "busy" | "stalled" | "error" | null}
+   */
+  _tensorFoldEngineState(data, status) {
+    if (data == null || typeof data !== "object" || Array.isArray(data)) return null;
+    const health = /** @type {Record<string, unknown>} */ (data);
+    if ((status != null && status >= 400) || health.ok === false) return "error";
+    const stepSeconds = tfCount(health.iteration_s);
+    if (stepSeconds != null && (this.requestsRunning ?? 0) > 0 && stepSeconds >= TENSORFOLD_STALLED_STEP_S) {
+      return "stalled";
+    }
+    const busy = health.busy;
+    if (busy === true || (typeof busy === "number" && busy > 0)) return "busy";
+    return (this.requestsRunning ?? 0) > 0 ? "busy" : "ready";
   }
 
   /**
@@ -3200,6 +3249,7 @@ export class LlmProbe {
       // context limit. Genuine multi-model routers still have no shared limit.
       contextLength: this.models.length > 1 && this.backendType !== "strata" ? null : this.contextLength,
       gpuMemoryUtilization: this.gpuMemoryUtilization,
+      engineState: this.engineState,
       slotsActive: this.slotsActive,
       slotsTotal: this.slotsTotal,
       generationTps: this.generationTps,
@@ -3246,6 +3296,7 @@ export class LlmProbe {
       models: [],
       contextLength: null,
       gpuMemoryUtilization: null,
+      engineState: null,
       slotsActive: 0,
       slotsTotal: 0,
       generationTps: 0,

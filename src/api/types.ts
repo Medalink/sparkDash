@@ -444,6 +444,9 @@ export interface UnifiedMemoryMetrics {
 }
 
 // ─── LLM metrics ─────────────────────────────────────────
+/** Explicit engine state reported by the backend (TensorFold /health). */
+export type LlmEngineState = "ready" | "busy" | "stalled" | "error";
+
 export interface LlmMetrics {
   /** The LLM port this snapshot came from — lets the UI match panels to probes by port, not array position. */
   port?: number;
@@ -462,6 +465,8 @@ export interface LlmMetrics {
   contextLength: number | null;
   /** GPU memory utilization for the LLM engine (0–1), e.g. 0.9. Only from vLLM internal info. */
   gpuMemoryUtilization: number | null;
+  /** Explicit engine state (TensorFold); overrides the Active/Sleeping reading. null when not reported. */
+  engineState?: LlmEngineState | null;
   /** Occupied slots; null when the backend does not report occupancy. */
   slotsActive: number | null;
   slotsTotal: number;
