@@ -111,7 +111,7 @@ test("rich /health queue stays unknown when /metrics is unreachable", async () =
   assert.equal(snap.requestsWaiting, null);
 });
 
-test("a queue count reported in /health live.waiting is not overwritten from /metrics", async () => {
+test("a queue count reported in /health live.waiting is not overwritten by /metrics", async () => {
   const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 8888);
   const seen = [];
   probe._fetch = async (url) => {
@@ -125,5 +125,7 @@ test("a queue count reported in /health live.waiting is not overwritten from /me
   };
   const snap = await probe.probe();
   assert.equal(snap.requestsWaiting, 5);
-  assert.equal(seen.some((u) => u.endsWith("/metrics")), false);
+  // /metrics is read every poll now (histograms, preemptions, cached tokens);
+  // its waiting gauge is only the fallback for builds that report no live.waiting.
+  assert.equal(seen.some((u) => u.endsWith("/metrics")), true);
 });

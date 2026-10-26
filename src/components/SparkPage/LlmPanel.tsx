@@ -46,6 +46,8 @@ interface LlmPanelProps {
 const VLLM_METRIC_INFO = {
   kvCache:
     "Free tokens left in the engine’s KV-cache pool, over the allocated pool (tokens and memory). The pool is shared across concurrent requests and can be larger than one request’s max context. High usage (≥80% full) means little room for new or long contexts and often leads to queuing or preemptions.",
+  kvCachePool:
+    "Fraction of TensorFold’s shared KV pool held by running streams and by kept prompt states. Kept states are reused for repeat prompts and evicted first when a request needs room, so an idle server can read above 0% and a high value is not a capacity problem.",
   requests:
     "Run = requests actively generating on the GPU. Wait = accepted but not yet scheduled (capacity or constraints). Growing wait with high KV cache usually means the server is overloaded.",
   ttftMean:
@@ -511,7 +513,9 @@ export function LlmPanel({
   const isVllm = llm != null && (llm.backend === "vllm" || llm.backend === "q27" || llm.backend === "radiance" || llm.backend === "flare" || llm.backend === "locals" || llm.backend === "splash");
   // FreeToken reports KV use, active requests and a TTFT mean in /v1/stats; the tiles below are null-gated.
   const isFreeToken = llm?.backend === "freetoken";
-  const showEngineTiles = isVllm || isFreeToken || isStrata;
+  // TensorFold fills the same engine tiles (KV pool, run / wait, TTFT, E2E, MTP).
+  const isTensorFold = llm?.backend === "tensorfold";
+  const showEngineTiles = isVllm || isFreeToken || isStrata || isTensorFold;
   const kvTone =
     llm?.kvCacheUsage == null
       ? ""
@@ -877,7 +881,9 @@ export function LlmPanel({
           )}
 
           <div className="sp-tiles">
-            {showEngineTiles && kvValue != null && tile("kvCache", "KV cache", kvValue, { tone: kvTone, sub: kvSub || undefined })}
+            {showEngineTiles &&
+              kvValue != null &&
+              tile(isTensorFold ? "kvCachePool" : "kvCache", "KV cache", kvValue, { tone: kvTone, sub: kvSub || undefined })}
             {showEngineTiles &&
               llm?.requestsRunning != null &&
               tile(

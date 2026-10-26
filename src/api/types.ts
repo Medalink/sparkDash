@@ -512,23 +512,23 @@ export interface LlmMetrics {
   kvCacheGb?: number | null;
   /** Engine model weights resident in GPU memory, GB (SGLang). null when not reported. */
   weightsGb?: number | null;
-  /** vLLM running request count. null when unavailable. */
+  /** Running (admitted) request count. null when unavailable. */
   requestsRunning?: number | null;
-  /** vLLM waiting request count. null when unavailable. */
+  /** Waiting (queued, not yet admitted) request count. null when unavailable. */
   requestsWaiting?: number | null;
-  /** vLLM time-to-first-token p95 in seconds. null when unavailable. */
+  /** Time-to-first-token p95 in seconds from the engine's histogram. null when unavailable. */
   ttftP95Seconds?: number | null;
-  /** Live recent-window mean TTFT (seconds) from vLLM histogram sum/count deltas. null when unavailable. */
+  /** Live recent-window mean TTFT (seconds) from TTFT histogram sum/count deltas. null when unavailable. */
   ttftSeconds?: number | null;
-  /** vLLM cumulative preemption count. null when unavailable. */
+  /** Cumulative preemption count. null when unavailable. */
   preemptionsTotal?: number | null;
-  /** vLLM prefix-cache hit rate (hits/queries, 0–1). null when unavailable. */
+  /** Prefix-cache hit rate (0–1). null when unavailable. */
   prefixCacheHitRate?: number | null;
-  /** vLLM end-to-end request latency p95 in seconds. null when unavailable. */
+  /** End-to-end request latency p95 in seconds. null when unavailable. */
   e2eP95Seconds?: number | null;
-  /** vLLM inter-token latency p95 in seconds. null when unavailable. */
+  /** Inter-token latency p95 in seconds. null when unavailable. */
   itlP95Seconds?: number | null;
-  /** vLLM speculative/MTP acceptance rate (accepted/drafted, 0–1). null when unavailable. */
+  /** Speculative/MTP acceptance rate (accepted/drafted, 0–1). null when unavailable. */
   mtpAcceptanceRate?: number | null;
   /**
    * Observational exposure hint from unauthenticated probe reachability +
